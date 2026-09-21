@@ -1,580 +1,283 @@
-Bullhorn Placement & Commission Automation
+# Bullhorn Placement & Commission Split Sync (n8n)
+
+An n8n workflow that automatically pulls placement and commission-split data from **Bullhorn Back Office (BBO)** and **Bullhorn ATS**, flattens it into one row per placement, and refreshes a **Google Sheet** every weekday morning. The sheet feeds downstream pivot tables and gross-margin reporting.
+
+---
+
+## Table of Contents
+
+- [Why this exists](#why-this-exists)
+- [How it works](#how-it-works)
+- [Workflow diagram](#workflow-diagram)
+- [Node-by-node breakdown](#node-by-node-breakdown)
+- [Commission routing logic](#commission-routing-logic)
+- [Output: Google Sheet schema](#output-google-sheet-schema)
+- [Tech stack](#tech-stack)
+- [Prerequisites](#prerequisites)
+- [Setup](#setup)
+- [Configuration reference](#configuration-reference)
+- [Schedule](#schedule)
+- [Known limitations](#known-limitations)
+- [Security notes](#security-notes)
+- [Repository structure](#repository-structure)
+- [License](#license)
+
+---
+
+## Why this exists
+
+Staffing firms tracking gross margin need to know **which recruiters/reps earn what share of each placement**. In Bullhorn, that commission-split data lives per placement and can't be pulled out of the standard canned reports in a usable, joinable shape.
+
+This workflow replaces a manual daily export-and-paste process with a fully automated one:
+
+- Pulls every assignment from BBO
+- Enriches each one with placement, candidate, client, and commission details from the Bullhorn ATS REST API
+- Writes a wide-format table (one row per placement, up to 4 reps as columns) into Google Sheets
+- Runs unattended on a schedule, including its own OAuth token rotation
+
+---
+
+## How it works
+
+1. **Schedule Trigger** fires at 07:30 on weekdays.
+2. **Token rotation:** the stored Bullhorn refresh token is read from a `Token` tab in Google Sheets, exchanged for a new access token + refresh token, and the new refresh token is written back to the sheet for the next run.
+3. **Session setup:** a Bullhorn REST session (`BhRestToken`) and a BBO session token are obtained.
+4. **Full refresh:** the `Placements` tab is cleared (header row kept).
+5. **Fetch assignments** from the BBO API and split them into individual items.
+6. **Loop over each assignment:** fetch the matching Placement entity from the Bullhorn ATS REST API (candidate, owner, job order, client, employment type, status, dates, commissions).
+7. **Normalise fields** (names as `Last, First`, percentages, ISO dates, rep 1-4 roles and splits).
+8. **Route by number of commission splits** (3 or 4) and append the row to the `Placements` tab.
+9. Loop until every assignment is processed.
+
+---
+
+## Workflow diagram
+
+```mermaid
+flowchart TD
+    A[Schedule Trigger<br/>07:30 Mon-Fri] --> B[Get Old Token<br/>Google Sheets]
+    B --> C[Refresh Token<br/>Bullhorn OAuth]
+    C --> D[Clear Old Token<br/>Google Sheets]
+    D --> E[Write New Token<br/>Google Sheets]
+    E --> F[Get BhRest Token<br/>Bullhorn REST login]
+    F --> G[Refresh Token for BBO<br/>BBO login]
+    G --> H[Clear sheet<br/>Placements tab]
+    H --> I[Get Assignments<br/>BBO API]
+    I --> J[Split Out<br/>Assignments]
+    J --> K{Loop Over Items}
+    K -->|each item| L[Get Placements<br/>Bullhorn ATS REST]
+    L --> M[Edit Fields<br/>normalise + map]
+    M --> N{Commission Routes}
+    N -->|3 commissions| O[Append row<br/>Placements tab]
+    N -->|4 commissions| P[Append row<br/>Placements tab]
+    N -->|fallback| Q[Filter<br/>Total Commissions = 4]
+    O --> K
+    P --> K
+    Q --> K
+```
+
+---
+
+## Node-by-node breakdown
+
+| # | Node | Type | What it does |
+|---|------|------|--------------|
+| 1 | **Schedule Trigger** | Schedule | Cron `0 30 7 * * 1-5`, weekdays at 07:30 (instance timezone). |
+| 2 | **Get Old Token** | Google Sheets (read) | Reads the current Bullhorn refresh token from the `Token` tab (column `Refresh token`). |
+| 3 | **Refresh Token** | HTTP Request | `POST auth-east.bullhornstaffing.com/oauth/token` with `grant_type=refresh_token`. Returns a new `access_token` and `refresh_token`. |
+| 4 | **Clear Old Token** | Google Sheets (clear) | Clears the `Token` tab, keeping the header row. |
+| 5 | **Write New Token** | Google Sheets (append) | Stores the new refresh token for the next run. |
+| 6 | **Get BhRest Token** | HTTP Request | `POST rest-east.bullhornstaffing.com/rest-services/login` using the fresh `access_token`. Returns `BhRestToken` and `restUrl`. |
+| 7 | **Refresh Token for BBO** | HTTP Request | `POST api.bbo.bullhornstaffing.com/v1.0/Login` to obtain a BBO API token. |
+| 8 | **Clear sheet** | Google Sheets (clear) | Clears the `Placements` tab (header kept) so each run is a full refresh. |
+| 9 | **Get Assignments** | HTTP Request | `GET api.bbo.bullhornstaffing.com/v1.0/Assignments` with the BBO token and vanity name. |
+| 10 | **Split Out** | Split Out | Splits the `Assignments` array into one item per assignment. |
+| 11 | **Loop Over Items** | Split In Batches | Iterates one assignment at a time. |
+| 12 | **Get Placements** | HTTP Request | `GET {restUrl}entity/Placement/{integrationId}` with the field list below. |
+| 13 | **Edit Fields** | Set | Builds the flat record (names, dates, employment type, status, Rep 1-4, roles, commission %). |
+| 14 | **Commission Routes** | Switch | Routes by `Total Commissions`: `3`, `4`, or fallback. |
+| 15 | **Append row in sheet2 / sheet3** | Google Sheets (append) | Writes the row for the 3-commission or 4-commission case. |
+| 16 | **Filter** | Filter | Fallback branch: passes items only where `Total Commissions = 4`. |
+
+**Placement fields requested from Bullhorn ATS:**
 
-An n8n workflow that retrieves placement and assignment data from Bullhorn Staffing, processes commission information, and writes the resulting placement records into Google Sheets.
+```
+id, owner(firstName,lastName), candidate(firstName,lastName), dateAdded, dateEnd,
+employmentType, status, payRate, clientBillRate, overtimeRate, clientOvertimeRate,
+customPayRate1, customBillRate1, jobOrder(title), clientCorporation(name),
+commissions(commissionPercentage,role,user(firstName,lastName))
+```
 
-The workflow is designed to automate a recurring placement/commission reporting process and route records based on the number of commission participants.
+**Values taken from each BBO assignment:** `integrationId` (used as the Bullhorn Placement ID), `startDate`, `prospectiveEndPeriod`.
 
-Overview
+---
 
-This workflow:
+## Commission routing logic
 
-Runs automatically on a weekday schedule.
+Each placement can have several commission recipients. The **Commission Routes** switch sends each record down one path based on `Total Commissions`:
 
-Retrieves the existing Bullhorn OAuth refresh token from Google Sheets.
+| Output | Condition | Result |
+|--------|-----------|--------|
+| `3 Commissions` | `Total Commissions == 3` | Row appended with Rep 1-3 |
+| `4 Commissions` | `Total Commissions == 4` | Row appended with Rep 1-4 |
+| Fallback | anything else | Sent to the `Filter` node (see [Known limitations](#known-limitations)) |
 
-Refreshes the Bullhorn REST API access token.
+> **Column ordering note:** in the output sheet, `Rep1` is populated from the *third* commission entry returned by Bullhorn and `Rep3` from the *first*. `Rep2` and `Rep4` map straight through. This reversal is intentional in the current build so the sheet matches the reporting layout. Adjust the mappings in the two Append nodes if your layout differs.
 
-Stores the new refresh token back in Google Sheets.
+---
 
-Authenticates with the Bullhorn BBO API.
+## Output: Google Sheet schema
 
-Retrieves assignment records.
+The workflow writes to a Google Sheet that feeds gross-margin pivot tables and reports. Sample output (names and companies redacted):
 
-Processes each assignment individually.
+![Placements sheet output](docs/sheet-output-sample.png)
 
-Retrieves detailed placement information from Bullhorn.
+The workflow expects a spreadsheet with **two tabs**.
 
-Extracts placement, candidate, company, owner, employment, status, and commission data.
+### Tab: `Token`
 
-Routes placements according to the number of commission participants.
+| Refresh token |
+|---------------|
+| *(current Bullhorn refresh token; managed by the workflow)* |
 
-Writes the processed records into the Placements Google Sheet.
+Seed this tab once with a valid refresh token before the first run.
 
-The workflow contains 17 n8n nodes and is configured with an execution order of v1.
+### Tab: `Placements`
 
-Workflow Architecture
+Header row (must exist; the workflow keeps it when clearing):
 
-Schedule Trigger
-      │
-      ▼
-Get Old Token
-      │
-      ▼
-Refresh Bullhorn OAuth Token
-      │
-      ▼
-Clear Old Token
-      │
-      ▼
-Write New Token
-      │
-      ▼
-Get Bullhorn REST Token
-      │
-      ├──────────────► Refresh Token for BBO
-      │                       │
-      │                       ▼
-      │                  Clear Placements Sheet
-      │                       │
-      │                       ▼
-      │                  Get Assignments
-      │                       │
-      │                       ▼
-      │                    Split Out
-      │                       │
-      │                       ▼
-      │                  Loop Over Items
-      │                       │
-      │                       ▼
-      │                  Get Placements
-      │                       │
-      │                       ▼
-      │                  Edit Fields
-      │                       │
-      │                       ▼
-      │               Commission Routes
-      │                 /       |       \
-      │                /        |        \
-      │               ▼         ▼         ▼
-      │         3 Commissions  4 Commissions  Filter
-      │                │         │             │
-      │                ▼         ▼             ▼
-      │            Placements  Placements   Loop
-      │
-      └── Bullhorn REST authentication
-
-Integrations
-
-Bullhorn Staffing
-
-The workflow uses Bullhorn APIs for:
-
-OAuth token refresh
-
-REST API authentication
-
-Assignment retrieval
-
-Placement retrieval
-
-Commission information
-
-The workflow uses the Bullhorn REST endpoints for authentication and placement retrieval, plus the Bullhorn BBO API for assignment data.
-
-Google Sheets
-
-Google Sheets is used for:
-
-Storing the Bullhorn refresh token
-
-Replacing the previous refresh token
-
-Clearing the previous placement dataset
-
-Writing processed placement records
-
-The source workflow references a workbook containing:
-
-Token sheet
-
-Placements sheet
-
-Main Workflow Components
-
-1. Schedule Trigger
-
-The workflow is configured with a weekday cron schedule:
-
-0 30 7 * * 1-5
-
-This corresponds to 7:30 AM, Monday through Friday, according to the timezone configured for the n8n instance.
-
-2. Token Management
-
-The workflow reads the existing refresh token from Google Sheets and sends it to Bullhorn's OAuth token endpoint.
-
-The refresh-token process:
-
-Google Sheets
-     ↓
-Existing Refresh Token
-     ↓
-Bullhorn OAuth Token Endpoint
-     ↓
-New Access / Refresh Token
-     ↓
-Google Sheets
-
-The old token is cleared before the new refresh token is written.
-
-3. Bullhorn REST Authentication
-
-After obtaining the OAuth access token, the workflow calls the Bullhorn REST login endpoint and obtains a BhRestToken and REST URL.
-
-These values are then used for subsequent Bullhorn REST API requests.
-
-4. BBO Authentication
-
-The workflow also authenticates with Bullhorn's BBO API using the configured BBO login process.
-
-The resulting token is used to retrieve assignment records.
-
-5. Assignment Retrieval
-
-The workflow requests assignment data from the BBO API and splits the returned Assignments array into individual n8n items.
-
-Each assignment is then processed through the loop.
-
-6. Placement Retrieval
-
-For each assignment, the workflow retrieves the corresponding Bullhorn Placement record.
-
-The placement request extracts information including:
-
-Placement ID
-
-Owner
-
-Candidate
-
-Placement dates
-
-Employment type
-
-Status
-
-Pay rate
-
-Client bill rate
-
-Overtime rates
-
-Job order
-
-Client corporation
-
-Commission information
-
-7. Field Transformation
-
-The Edit Fields node transforms the Bullhorn response into reporting-friendly fields.
-
-The workflow prepares information such as:
-
-Field
-
-Description
-
-Start Date
-
-Placement start date
-
-Employee Name
-
-Candidate name
-
-Owner
-
-Placement owner
-
-Employee Title
-
-Job title
-
-Company Name
-
-Client/company
-
-Placement ID
-
-Bullhorn placement ID
-
-Total Commissions
-
-Number of commission records
-
-Employment Type
-
-Placement employment type
-
-Rep1–Rep4
-
-Commission representatives
-
-Rep1–Rep4 Role
-
-Commission roles
-
-Rep1–Rep4 Commission
-
-Commission percentages
-
-End Date
-
-Placement end/prospective end date
-
-Status
-
-Placement status
-
-Date Added
-
-Placement creation/addition date
-
-8. Commission Routing
-
-The Commission Routes switch routes records based on the Total Commissions value.
-
-Current routes include:
-
-3 Commissions
-
-4 Commissions
-
-Additional/fallback processing through the filter and loop
-
-For records with three commission participants, the workflow writes the applicable three-representative structure.
-
-For records with four commission participants, it writes all four representatives and their roles/commission percentages.
-
-9. Google Sheets Output
-
-The final placement data is written to the Placements sheet.
-
-The output includes:
-
-Company
-
-Owner
-
-Job Title
-
-Candidate
-
-Start Date
-
-End Date
-
-Date Added
-
-Placement ID
-
-Placement Type
-
-Commission representatives
-
-Commission roles
-
-Commission percentages
-
-Status
-
+```
+Placement | Company | Job Title | Owner | Placement Type | Status | Candidate |
+Date Added | Start Date | End Date |
+Rep1 | Comm Role1 | Rep1 % |
+Rep2 | Comm Role2 | Rep2 % |
+Rep3 | Comm Role3 | Rep3 % |
+Rep4 | Comm Role4 | Rep4 % |
 Check
+```
 
-The workflow currently writes a 100.00% value into the Check field for the routed placement records.
+| Column | Source |
+|--------|--------|
+| Placement | Bullhorn Placement `id` |
+| Company | `clientCorporation.name` |
+| Job Title | `jobOrder.title` |
+| Owner | `owner` as `Last, First` |
+| Placement Type | `employmentType` |
+| Status | `status` |
+| Candidate | `candidate` as `Last, First` |
+| Date Added | `dateAdded` (formatted `YYYY-MM-DD`) |
+| Start Date | BBO assignment `startDate` |
+| End Date | Placement `dateEnd` (formatted `YYYY-MM-DD`) |
+| Rep N / Comm Role N / Rep N % | `commissions.data[]` user, role, and `commissionPercentage x 100` |
+| Check | Static `100.00%` (sanity column for downstream sheet validation) |
 
-Google Sheets Structure
+---
 
-Token Sheet
+## Tech stack
 
-The workflow expects a refresh-token field:
+- **n8n** (workflow automation)
+- **Bullhorn ATS REST API** (OAuth 2.0, `rest-east`)
+- **Bullhorn Back Office (BBO) API** (`api.bbo.bullhornstaffing.com/v1.0`)
+- **Google Sheets API** (via n8n Google Sheets OAuth2 credential)
 
-Refresh token
+---
 
-The token is read before authentication and the refreshed token is written back after the OAuth refresh process.
+## Prerequisites
 
-Placements Sheet
+- An n8n instance (cloud or self-hosted)
+- Bullhorn ATS API access: a **Client ID**, **Client Secret**, and a valid **refresh token**
+- Bullhorn Back Office API access: a BBO **username**, **password**, and **vanity name**
+- A Google account with access to the target spreadsheet
+- The Bullhorn data center for your account (the workflow is built for the **East** cluster, see [Configuration reference](#configuration-reference))
 
-The output sheet contains placement and commission reporting fields such as:
+---
 
-Placement
-Company
-Job Title
-Owner
-Placement Type
-Status
-Candidate
-Date Added
-Start Date
-End Date
-Rep1
-Comm Role1
-Rep1 %
-Rep2
-Comm Role2
-Rep2 %
-Rep3
-Comm Role3
-Rep3 %
-Rep4
-Comm Role4
-Rep4 %
-Check
+## Setup
 
-Requirements
+### 1. Prepare the Google Sheet
 
-Before importing and running this workflow, you need:
+Create a spreadsheet with the `Token` and `Placements` tabs described in [Output: Google Sheet schema](#output-google-sheet-schema). Paste your current Bullhorn refresh token under the `Refresh token` header in the `Token` tab.
 
-n8n
+### 2. Create credentials in n8n
 
-Bullhorn Staffing API access
+| Credential | Used by |
+|------------|---------|
+| **Google Sheets OAuth2** | Get Old Token, Clear Old Token, Write New Token, Clear sheet, both Append nodes |
+| **OAuth2 API** (Bullhorn) | Get BhRest Token |
 
-Bullhorn OAuth credentials
+### 3. Build the workflow in n8n
 
-Bullhorn BBO API credentials
+Create a new workflow and add the nodes in the order shown in the [workflow diagram](#workflow-diagram), configuring each one as described in the [node-by-node breakdown](#node-by-node-breakdown).
 
-Google account access
+Node names are referenced inside expressions (for example `$('Get BhRest Token')`, `$('Loop Over Items')`, `$('Edit Fields')`). If you rename a node, update every expression that points to it.
 
-Google Sheets API/OAuth credentials
+### 4. Enter your values
 
-A Google Spreadsheet containing the required Token and Placements sheets
+| Value | Node | Notes |
+|-------|------|-------|
+| Bullhorn client ID and client secret | Refresh Token | Query parameters `client_id` and `client_secret` |
+| Bullhorn refresh token | `Token` tab in the sheet | Seed once before the first run |
+| BBO username and password | Refresh Token for BBO | JSON body fields `username`, `password`, with `process` set to `login` |
+| BBO vanity name | Refresh Token for BBO, Get Assignments | Query parameter `vanityName` |
+| Spreadsheet and tabs | All Google Sheets nodes | Select your spreadsheet, then the `Token` or `Placements` tab |
 
-Configuration
+Keep secrets in n8n credentials or environment variables rather than typing them into node fields.
 
-Bullhorn
+### 5. Test, then publish
 
-Configure your Bullhorn credentials using n8n credentials rather than hard-coding secrets inside workflow nodes.
+Run the workflow manually once, confirm the `Placements` tab fills correctly and the `Token` tab holds a new refresh token, then **publish** the workflow.
 
-You will need the appropriate:
+---
 
-Client ID
+## Configuration reference
 
-Client Secret
+| Setting | Location | Default |
+|---------|----------|---------|
+| Schedule | Schedule Trigger | `0 30 7 * * 1-5` (07:30, Mon-Fri) |
+| Bullhorn OAuth host | Refresh Token node | `auth-east.bullhornstaffing.com` |
+| Bullhorn REST login host | Get BhRest Token node | `rest-east.bullhornstaffing.com` |
+| Session TTL | Get BhRest Token node | `480` minutes |
+| BBO API base | Refresh Token for BBO / Get Assignments | `api.bbo.bullhornstaffing.com/v1.0` |
+| Placement fields | Get Placements node (`fields` param) | See [Node-by-node breakdown](#node-by-node-breakdown) |
 
-Refresh Token
+If your Bullhorn account is not on the East data center, update the OAuth and REST login hosts accordingly.
 
-Bullhorn REST authentication
+---
 
-BBO authentication details
+## Schedule
 
-Google Sheets
+The workflow runs at **07:30 on weekdays** in the n8n instance's timezone (set under **Settings -> Workflow -> Timezone** or the instance default). Change the cron expression in the Schedule Trigger node to adjust.
 
-Create or select a Google Spreadsheet and configure the required sheets:
+---
 
-Token
-Placements
+## Known limitations
 
-Make sure the n8n Google Sheets credential has permission to access the workbook.
+These are observations from the current build, worth reviewing before relying on it for edge cases:
 
-Important: Do Not Commit Secrets
+- **Only 3 and 4-commission placements are written.** Placements with any other number of commission splits go to the fallback output, which feeds the `Filter` node. That filter only passes `Total Commissions = 4`, so fallback items are dropped and never return to the loop. Depending on n8n's batching behaviour this can end the loop early. If your data includes 1, 2, 5, or 6-rep placements, add matching Switch outputs or route the fallback straight back to `Loop Over Items`.
+- **Up to 4 reps supported.** The Edit Fields node reads `commissions.data[0]` to `[3]` only.
+- **Full refresh each run.** The `Placements` tab is cleared at the start. If the run fails midway, the sheet will be partially filled until the next successful run.
+- **Token rotation is not atomic.** The refresh token is cleared and then rewritten. If a run fails between *Clear Old Token* and *Write New Token*, the stored token can be lost and must be re-seeded manually.
+- **`Check` is a static value** (`100.00%`), not a calculated total of the rep percentages.
+- **Sequential processing.** One placement lookup per item, so runtime grows with the number of assignments.
 
-Never commit API keys, client secrets, passwords, OAuth refresh tokens, or private credentials to GitHub.
+---
 
-The original workflow JSON used during development contains authentication values. Before uploading the JSON to a public or shared GitHub repository:
+## Security notes
 
-Remove all hard-coded credentials.
+- **Never commit real credentials.** Do not add n8n workflow exports or screenshots to this repo without scrubbing client IDs/secrets, BBO username/password, vanity name, spreadsheet IDs, and credential IDs.
+- Prefer **n8n credentials** (or environment variables) over hardcoding secrets in HTTP Request nodes.
+- Rotate any secret that was ever pasted into a workflow export or committed to Git history.
+- Sheet data contains candidate and employee names and commission splits. Restrict spreadsheet sharing accordingly.
 
-Replace secrets with n8n credentials or secure environment variables.
+---
 
-Remove private Google Sheet IDs where appropriate.
+## Repository structure
 
-Review every HTTP Request node for embedded authentication values.
-
-If any real credentials were exposed, rotate/revoke them before publishing the repository.
-
-For example, use placeholders such as:
-
-YOUR_BULLHORN_CLIENT_ID
-YOUR_BULLHORN_CLIENT_SECRET
-YOUR_REFRESH_TOKEN
-YOUR_BBO_USERNAME
-YOUR_BBO_PASSWORD
-YOUR_GOOGLE_SHEET_ID
-
-Importing the Workflow into n8n
-
-Open your n8n instance.
-
-Create a new workflow.
-
-Select Import from File.
-
-Select the sanitized workflow JSON.
-
-Reconnect the required credentials.
-
-Configure the Google Spreadsheet and sheet names.
-
-Verify the Bullhorn API configuration.
-
-Test the workflow manually.
-
-Confirm the placement records are written correctly.
-
-Activate the workflow after successful testing.
-
-Data Flow
-
-Bullhorn OAuth
-      ↓
-REST Authentication
-      ↓
-BBO Authentication
-      ↓
-Assignments
-      ↓
-Individual Assignment
-      ↓
-Placement Details
-      ↓
-Field Transformation
-      ↓
-Commission Count
-      ↓
-Commission Routing
-      ↓
-Google Sheets
-
-Error Handling & Validation
-
-Before using this workflow in production, consider adding:
-
-API error branches
-
-Retry handling for Bullhorn API failures
-
-Google Sheets error handling
-
-Empty assignment validation
-
-Missing commission validation
-
-Missing representative validation
-
-Rate-limit handling
-
-Execution notifications
-
-Logging/monitoring
-
-Duplicate placement protection
-
-In particular, commission fields reference multiple commission indexes. If a placement contains fewer commission records than expected, those fields should be validated before accessing them.
-
-Security Notes
-
-This workflow handles authentication tokens and business data. Recommended security practices:
-
-Store credentials in n8n Credentials.
-
-Do not hard-code passwords in workflow JSON.
-
-Do not commit production tokens to Git.
-
-Use private GitHub repositories for sensitive automation projects.
-
-Rotate credentials if they are accidentally exposed.
-
-Restrict Google Sheets permissions to the required account.
-
-Review workflow exports before sharing them publicly.
-
-Project Structure
-
-A recommended repository structure:
-
-bullhorn-placement-automation/
-│
+```
+.
 ├── README.md
-├── workflows/
-│   └── bullhorn-placement-flow.json
-│
-├── docs/
-│   └── workflow-architecture.md
-│
-└── .gitignore
-
-Example .gitignore:
-
-.env
-*.secret
-credentials.json
-credentials.local.json
-node_modules/
-.DS_Store
-
-Use Case
-
-This automation is useful for staffing/recruiting operations that need to regularly synchronize Bullhorn placement information into a Google Sheets-based reporting or gross-margin tracking process.
-
-It reduces manual work involved in:
-
-Pulling placement records
-
-Collecting assignment data
-
-Extracting commission participants
-
-Formatting placement information
-
-Separating records by commission structure
-
-Updating a reporting spreadsheet
-
-Technologies
-
-n8n
-
-Bullhorn Staffing API
-
-Bullhorn BBO API
-
-OAuth 2.0
-
-Google Sheets
-
-REST APIs
-
-JavaScript expressions in n8n
-
-Notes
-
-This README documents the workflow structure and behavior based on the supplied n8n workflow export. Endpoint configuration, credentials, spreadsheet IDs, and other environment-specific values should be configured separately for each deployment.
-
-License
-
-Add the license that matches how you intend to distribute this workflow.
-
-For a private/client project, you can use:
-
-Copyright © 2026. All rights reserved.
+└── docs/
+    ├── workflow-overview.png      # n8n canvas screenshot
+    └── sheet-output-sample.png    # Placements tab output (redacted)
+```
